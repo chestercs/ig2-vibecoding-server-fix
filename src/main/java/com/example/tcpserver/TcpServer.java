@@ -11,7 +11,6 @@ public class TcpServer {
     private static final int PORT = 1611;
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
-    private static final int RATE_LIMIT_MS = 50;
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -48,7 +47,6 @@ public class TcpServer {
         private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
         private volatile int lastPingId = 0;
         private volatile long lastPongTime = System.currentTimeMillis();
-        private long lastBroadcastTime = 0;
 
         ClientHandler(Socket socket, int clientId) throws IOException {
             this.socket = socket;
@@ -94,20 +92,22 @@ public class TcpServer {
 
             switch (cmd) {
                 case "send":
-                    handleSend(params, message.substring(message.indexOf('|') + 1));
+                    broadcastLobbyMessage("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|" + message.substring(message.indexOf('|') + 1));
+                    sendAck();
                     break;
                 case "query":
-                    handleQuery(params);
+                    handleQuery();
                     break;
                 case "info":
-                    handleInfo(params);
+                    clientParams.put(clientId, params);
                     sendAck();
                     break;
                 case "connect":
                     handleConnect(params);
                     break;
                 case "start":
-                    broadcastMessage(clientId, message);
+                    broadcastLobbyMessage(message);
+                    sendAck();
                     break;
                 default:
                     sendAck();
@@ -115,43 +115,36 @@ public class TcpServer {
             }
         }
 
-        private void handleSend(Map<String, String> params, String data) throws IOException {
-            sendAck();
-            broadcastMessage(clientId, "fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|" + data);
-        }
-
-        private void broadcastMessage(int senderId, String msg) {
-            lobbyConnections.get(senderId).forEach(targetId -> {
-                ClientHandler target = clients.get(targetId);
-                if (target != null) target.sendMessage(msg);
-            });
-        }
-
-        private void handleQuery(Map<String, String> params) throws IOException {
-            StringBuilder gamelist = new StringBuilder("gamelist:");
-
-            clients.forEach((id, handler) -> {
-                Map<String, String> gp = clientParams.get(id);
-                if (gp != null && gp.containsKey("nam")) {
-                    gamelist.append("id:").append(id).append(",nam:").append(gp.get("nam")).append("|");
-                }
-            });
-
-            if (gamelist.charAt(gamelist.length() - 1) == '|') gamelist.setLength(gamelist.length() - 1);
-            sendMessage(gamelist.toString());
-        }
-
-        private void handleInfo(Map<String, String> params) {
-            clientParams.put(clientId, params);
-        }
-
         private void handleConnect(Map<String, String> params) {
             int hostId = Integer.parseInt(params.get("tc"));
             lobbyConnections.get(hostId).add(clientId);
             lobbyConnections.get(clientId).add(hostId);
+
             ClientHandler host = clients.get(hostId);
-            if (host != null) host.sendMessage("fc:" + clientId + "|!connect!");
+            if (host != null) {
+                host.sendMessage("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
+            }
             sendAck();
+        }
+
+        private void broadcastLobbyMessage(String msg) {
+            lobbyConnections.get(clientId).forEach(targetId -> {
+                ClientHandler target = clients.get(targetId);
+                if (target != null && target.clientId != clientId) target.sendMessage(msg);
+            });
+        }
+
+        private void handleQuery() throws IOException {
+            StringBuilder gamelist = new StringBuilder("gamelist:");
+            clients.forEach((id, handler) -> {
+                Map<String, String> gp = clientParams.get(id);
+                if (gp != null && gp.containsKey("nam")) {
+                    String name = gp.get("nam");
+                    gamelist.append("id:").append(id).append(",nam:").append(name).append("|");
+                }
+            });
+            if (gamelist.charAt(gamelist.length() - 1) == '|') gamelist.setLength(gamelist.length() - 1);
+            sendMessage(gamelist.toString());
         }
 
         private void sendPing() {
