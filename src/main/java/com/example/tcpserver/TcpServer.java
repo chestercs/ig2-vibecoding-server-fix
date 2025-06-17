@@ -11,7 +11,7 @@ public class TcpServer {
     private static final int PORT = 1611;
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
-    private static final int RATE_LIMIT_INTERVAL_MS = 100;
+    private static final int RATE_LIMIT_INTERVAL_MS = 50;
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -29,6 +29,7 @@ public class TcpServer {
 
         while (true) {
             Socket socket = serverSocket.accept();
+            socket.setTcpNoDelay(true);
             int clientId = ++clientIdCounter;
             ClientHandler handler = new ClientHandler(socket, clientId);
             clients.put(clientId, handler);
@@ -54,8 +55,8 @@ public class TcpServer {
         ClientHandler(Socket socket, int clientId) throws IOException {
             this.socket = socket;
             this.clientId = clientId;
-            this.input = new DataInputStream(socket.getInputStream());
-            this.output = new DataOutputStream(socket.getOutputStream());
+            this.input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+            this.output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             sendClientId();
 
             scheduler.scheduleAtFixedRate(this::flushMessages, RATE_LIMIT_INTERVAL_MS, RATE_LIMIT_INTERVAL_MS, TimeUnit.MILLISECONDS);
@@ -159,10 +160,11 @@ public class TcpServer {
             while (!messageQueue.isEmpty()) {
                 sendMessage(messageQueue.poll());
             }
+            try { output.flush(); } catch (IOException e) { shutdown(); }
         }
 
         private void sendPing() {
-            sendMessage("ping:" + (++lastPingId));
+            enqueueMessage("ping:" + (++lastPingId));
         }
 
         private void checkTimeout() {
@@ -178,10 +180,7 @@ public class TcpServer {
                 byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
                 output.writeInt(Integer.reverseBytes(msgBytes.length));
                 output.write(msgBytes);
-                output.flush();
-            } catch (IOException e) {
-                shutdown();
-            }
+            } catch (IOException e) { shutdown(); }
         }
 
         private Map<String, String> parseMessage(String msg) {
