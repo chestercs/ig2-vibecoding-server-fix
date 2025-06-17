@@ -11,6 +11,8 @@ public class TcpServer {
     private static final int PORT = 1611;
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
+    private static final int MESSAGE_BUFFER_MS = 20;
+    private static final int RATE_LIMIT_INTERVAL_MS = 50;
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -44,9 +46,12 @@ public class TcpServer {
         private final DataInputStream input;
         private final DataOutputStream output;
         private volatile boolean running = true;
-        private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
         private volatile int lastPingId = 0;
         private volatile long lastPongTime = System.currentTimeMillis();
+
+        private final Queue<String> messageQueue = new ConcurrentLinkedQueue<>();
+        private long lastSentTime = 0;
 
         ClientHandler(Socket socket, int clientId) throws IOException {
             this.socket = socket;
@@ -54,6 +59,8 @@ public class TcpServer {
             this.input = new DataInputStream(socket.getInputStream());
             this.output = new DataOutputStream(socket.getOutputStream());
             sendClientId();
+
+            scheduler.scheduleAtFixedRate(this::flushMessages, MESSAGE_BUFFER_MS, MESSAGE_BUFFER_MS, TimeUnit.MILLISECONDS);
         }
 
         private void sendClientId() throws IOException {
@@ -81,7 +88,7 @@ public class TcpServer {
             }
         }
 
-        private void handleMessage(String message) throws IOException {
+        private void handleMessage(String message) {
             if (message.startsWith("pong:")) {
                 lastPongTime = System.currentTimeMillis();
                 return;
@@ -115,6 +122,25 @@ public class TcpServer {
             }
         }
 
+        private void broadcastLobbyMessage(String msg) {
+            lobbyConnections.get(clientId).forEach(targetId -> {
+                ClientHandler target = clients.get(targetId);
+                if (target != null && target.clientId != clientId) target.enqueueMessage(msg);
+            });
+        }
+
+        private void handleQuery() {
+            StringBuilder gamelist = new StringBuilder("gamelist:");
+            clients.forEach((id, handler) -> {
+                Map<String, String> gp = clientParams.get(id);
+                if (gp != null && gp.containsKey("nam")) {
+                    gamelist.append("id:").append(id).append(",nam:").append(gp.get("nam")).append("|");
+                }
+            });
+            if (gamelist.charAt(gamelist.length() - 1) == '|') gamelist.setLength(gamelist.length() - 1);
+            enqueueMessage(gamelist.toString());
+        }
+
         private void handleConnect(Map<String, String> params) {
             int hostId = Integer.parseInt(params.get("tc"));
             lobbyConnections.get(hostId).add(clientId);
@@ -122,29 +148,25 @@ public class TcpServer {
 
             ClientHandler host = clients.get(hostId);
             if (host != null) {
-                host.sendMessage("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
+                host.enqueueMessage("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
             }
             sendAck();
         }
 
-        private void broadcastLobbyMessage(String msg) {
-            lobbyConnections.get(clientId).forEach(targetId -> {
-                ClientHandler target = clients.get(targetId);
-                if (target != null && target.clientId != clientId) target.sendMessage(msg);
-            });
+        private void enqueueMessage(String msg) {
+            messageQueue.offer(msg);
         }
 
-        private void handleQuery() throws IOException {
-            StringBuilder gamelist = new StringBuilder("gamelist:");
-            clients.forEach((id, handler) -> {
-                Map<String, String> gp = clientParams.get(id);
-                if (gp != null && gp.containsKey("nam")) {
-                    String name = gp.get("nam");
-                    gamelist.append("id:").append(id).append(",nam:").append(name).append("|");
-                }
-            });
-            if (gamelist.charAt(gamelist.length() - 1) == '|') gamelist.setLength(gamelist.length() - 1);
-            sendMessage(gamelist.toString());
+        private void flushMessages() {
+            long now = System.currentTimeMillis();
+            if (now - lastSentTime < RATE_LIMIT_INTERVAL_MS) return;
+
+            List<String> msgs = new ArrayList<>();
+            while (!messageQueue.isEmpty()) msgs.add(messageQueue.poll());
+            if (!msgs.isEmpty()) {
+                sendMessage(String.join("|", msgs));
+                lastSentTime = now;
+            }
         }
 
         private void sendPing() {
@@ -156,7 +178,7 @@ public class TcpServer {
         }
 
         private void sendAck() {
-            sendMessage("ack:ok");
+            enqueueMessage("ack:ok");
         }
 
         private void sendMessage(String msg) {
