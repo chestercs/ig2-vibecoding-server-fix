@@ -47,6 +47,8 @@ public class TcpServer {
         private final DataOutputStream output;
         private volatile boolean running = true;
         private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+        private ScheduledExecutorService flushScheduler = Executors.newSingleThreadScheduledExecutor();
+        private final Queue<byte[]> sendQueue = new ConcurrentLinkedQueue<>();
 
         private volatile int lastPingId = 0;
         private volatile long lastPongTime = System.currentTimeMillis();
@@ -60,6 +62,9 @@ public class TcpServer {
             this.input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             this.output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             sendClientId();
+
+            // Background flusher for game messages
+            flushScheduler.scheduleAtFixedRate(this::flushSendQueue, 0, 15, TimeUnit.MILLISECONDS);
         }
 
         private void sendClientId() throws IOException {
@@ -98,8 +103,7 @@ public class TcpServer {
             Map<String, String> params = parseMessage(message);
             String cmd = params.get("cmd");
 
-            // ELŐRE KÜLDJÜK az ack-ot
-            sendAck();
+            sendAck(); // pre-emptive ack
 
             switch (cmd) {
                 case "send":
@@ -139,14 +143,41 @@ public class TcpServer {
                 for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
                     if (sent.add(targetId) && rateLimitPassed(targetId, now)) {
                         ClientHandler target = clients.get(targetId);
-                        if (target != null) target.sendInstant(msg);
+                        if (target != null) target.enqueueMessage(msg);
                     }
                 }
             } else {
                 int targetId = Integer.parseInt(tcStr);
                 if (rateLimitPassed(targetId, now)) {
                     ClientHandler target = clients.get(targetId);
-                    if (target != null) target.sendInstant(msg);
+                    if (target != null) target.enqueueMessage(msg);
+                }
+            }
+        }
+
+        private void enqueueMessage(String msg) {
+            byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            DataOutputStream dos = new DataOutputStream(baos);
+            try {
+                dos.writeInt(Integer.reverseBytes(msgBytes.length));
+                dos.write(msgBytes);
+                dos.flush();
+                sendQueue.offer(baos.toByteArray());
+            } catch (IOException ignored) {}
+        }
+
+        private void flushSendQueue() {
+            if (!sendQueue.isEmpty()) {
+                try {
+                    synchronized (writeLock) {
+                        while (!sendQueue.isEmpty()) {
+                            output.write(sendQueue.poll());
+                        }
+                        output.flush();
+                    }
+                } catch (IOException e) {
+                    shutdown();
                 }
             }
         }
@@ -165,7 +196,7 @@ public class TcpServer {
             for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
                 if (sent.add(targetId)) {
                     ClientHandler target = clients.get(targetId);
-                    if (target != null) target.sendInstant(msg);
+                    if (target != null) target.enqueueMessage(msg);
                 }
             }
         }
@@ -173,7 +204,7 @@ public class TcpServer {
         private void syncInfoToLobby(String msg) {
             for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
                 ClientHandler target = clients.get(targetId);
-                if (target != null) target.sendInstant(msg);
+                if (target != null) target.enqueueMessage(msg);
             }
         }
 
@@ -188,7 +219,7 @@ public class TcpServer {
             if (gamelist.length() > 9 && gamelist.charAt(gamelist.length() - 1) == '|') {
                 gamelist.setLength(gamelist.length() - 1);
             }
-            sendInstant(gamelist.toString());
+            enqueueMessage(gamelist.toString());
         }
 
         private void handleConnect(Map<String, String> params) {
@@ -198,15 +229,19 @@ public class TcpServer {
 
             ClientHandler host = clients.get(hostId);
             if (host != null) {
-                host.sendInstant("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
+                host.enqueueMessage("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
             }
         }
 
         private void sendAck() {
-            sendInstant("ack:ok");
+            sendImmediate("ack:ok");
         }
 
-        private void sendInstant(String msg) {
+        private void sendPing() {
+            sendImmediate("ping:" + (++lastPingId));
+        }
+
+        private void sendImmediate(String msg) {
             try {
                 byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
                 synchronized (writeLock) {
@@ -217,10 +252,6 @@ public class TcpServer {
             } catch (IOException e) {
                 shutdown();
             }
-        }
-
-        private void sendPing() {
-            sendInstant("ping:" + (++lastPingId));
         }
 
         private void checkTimeout() {
@@ -252,6 +283,7 @@ public class TcpServer {
             clients.remove(clientId);
             lobbyConnections.remove(clientId);
             scheduler.shutdown();
+            flushScheduler.shutdown();
             try {
                 socket.close();
             } catch (IOException ignored) {}
