@@ -50,7 +50,7 @@ public class TcpServer {
         private volatile int lastPingId = 0;
         private volatile long lastPongTime = System.currentTimeMillis();
 
-        private final Queue<String> messageQueue = new ConcurrentLinkedQueue<>();
+        private final Deque<String> messageQueue = new ConcurrentLinkedDeque<>();
 
         ClientHandler(Socket socket, int clientId) throws IOException {
             this.socket = socket;
@@ -105,7 +105,9 @@ public class TcpServer {
                     handleQuery();
                     break;
                 case "info":
-                    clientParams.put(clientId, params);
+                    if (params.containsKey("nam") && !params.get("nam").trim().isEmpty()) {
+                        clientParams.put(clientId, params);
+                    }
                     sendAck();
                     break;
                 case "connect":
@@ -124,7 +126,7 @@ public class TcpServer {
         private void broadcastLobbyMessage(String msg) {
             lobbyConnections.get(clientId).forEach(targetId -> {
                 ClientHandler target = clients.get(targetId);
-                if (target != null && target.clientId != clientId) target.enqueueMessage(msg);
+                if (target != null) target.enqueueMessage(msg);
             });
         }
 
@@ -132,18 +134,19 @@ public class TcpServer {
             StringBuilder gamelist = new StringBuilder("gamelist:");
             clients.forEach((id, handler) -> {
                 Map<String, String> gp = clientParams.get(id);
-                if (gp != null && gp.containsKey("nam")) {
+                if (gp != null && gp.containsKey("nam") && !gp.get("nam").trim().isEmpty()) {
                     gamelist.append("id:").append(id).append(",nam:").append(gp.get("nam")).append("|");
                 }
             });
-            if (gamelist.charAt(gamelist.length() - 1) == '|') gamelist.setLength(gamelist.length() - 1);
+            if (gamelist.length() > 9 && gamelist.charAt(gamelist.length() - 1) == '|') {
+                gamelist.setLength(gamelist.length() - 1);
+            }
             enqueueMessage(gamelist.toString());
         }
 
         private void handleConnect(Map<String, String> params) {
             int hostId = Integer.parseInt(params.get("tc"));
-            lobbyConnections.get(hostId).add(clientId);
-            lobbyConnections.get(clientId).add(hostId);
+            lobbyConnections.get(clientId).add(hostId); // Only one-way
 
             ClientHandler host = clients.get(hostId);
             if (host != null) {
@@ -156,11 +159,19 @@ public class TcpServer {
             messageQueue.offer(msg);
         }
 
+        private void enqueueAck(String msg) {
+            messageQueue.addFirst(msg); // Prioritize ACKs
+        }
+
         private void flushMessages() {
             while (!messageQueue.isEmpty()) {
                 sendMessage(messageQueue.poll());
             }
-            try { output.flush(); } catch (IOException e) { shutdown(); }
+            try {
+                output.flush();
+            } catch (IOException e) {
+                shutdown();
+            }
         }
 
         private void sendPing() {
@@ -172,7 +183,7 @@ public class TcpServer {
         }
 
         private void sendAck() {
-            enqueueMessage("ack:ok");
+            enqueueAck("ack:ok");
         }
 
         private void sendMessage(String msg) {
@@ -180,7 +191,9 @@ public class TcpServer {
                 byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
                 output.writeInt(Integer.reverseBytes(msgBytes.length));
                 output.write(msgBytes);
-            } catch (IOException e) { shutdown(); }
+            } catch (IOException e) {
+                shutdown();
+            }
         }
 
         private Map<String, String> parseMessage(String msg) {
@@ -198,7 +211,9 @@ public class TcpServer {
             clients.remove(clientId);
             lobbyConnections.remove(clientId);
             scheduler.shutdown();
-            try { socket.close(); } catch (IOException ignored) {}
+            try {
+                socket.close();
+            } catch (IOException ignored) {}
             System.out.println("Client disconnected (id: " + clientId + ")");
         }
     }
