@@ -47,8 +47,6 @@ public class TcpServer {
         private final DataOutputStream output;
         private volatile boolean running = true;
         private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
-        private final ScheduledExecutorService ackExecutor = Executors.newSingleThreadScheduledExecutor();
-        private final Queue<String> ackQueue = new ConcurrentLinkedQueue<>();
 
         private volatile int lastPingId = 0;
         private volatile long lastPongTime = System.currentTimeMillis();
@@ -62,8 +60,6 @@ public class TcpServer {
             this.input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             this.output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             sendClientId();
-
-            ackExecutor.scheduleAtFixedRate(this::flushAckQueue, 1, 5, TimeUnit.MILLISECONDS);
         }
 
         private void sendClientId() throws IOException {
@@ -102,10 +98,12 @@ public class TcpServer {
             Map<String, String> params = parseMessage(message);
             String cmd = params.get("cmd");
 
+            // ELŐRE KÜLDJÜK az ack-ot
+            sendAck();
+
             switch (cmd) {
                 case "send":
                     handleSend(params, message);
-                    enqueueAck();
                     break;
                 case "query":
                     handleQuery();
@@ -115,17 +113,14 @@ public class TcpServer {
                         clientParams.put(clientId, params);
                         syncInfoToLobby("info," + formatParams(params));
                     }
-                    enqueueAck();
                     break;
                 case "connect":
                     handleConnect(params);
                     break;
                 case "start":
                     broadcastLobbyMessage(message);
-                    enqueueAck();
                     break;
                 default:
-                    enqueueAck();
                     break;
             }
         }
@@ -205,18 +200,10 @@ public class TcpServer {
             if (host != null) {
                 host.sendInstant("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
             }
-            enqueueAck();
         }
 
-        private void enqueueAck() {
-            ackQueue.offer("ack:ok");
-        }
-
-        private void flushAckQueue() {
-            while (!ackQueue.isEmpty()) {
-                String msg = ackQueue.poll();
-                sendInstant(msg);
-            }
+        private void sendAck() {
+            sendInstant("ack:ok");
         }
 
         private void sendInstant(String msg) {
@@ -265,7 +252,6 @@ public class TcpServer {
             clients.remove(clientId);
             lobbyConnections.remove(clientId);
             scheduler.shutdown();
-            ackExecutor.shutdown();
             try {
                 socket.close();
             } catch (IOException ignored) {}
