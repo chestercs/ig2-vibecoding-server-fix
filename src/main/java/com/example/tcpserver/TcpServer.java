@@ -11,7 +11,6 @@ public class TcpServer {
     private static final int PORT = 1611;
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
-    private static final int RATE_LIMIT_INTERVAL_MS = 50;
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -50,7 +49,7 @@ public class TcpServer {
         private volatile int lastPingId = 0;
         private volatile long lastPongTime = System.currentTimeMillis();
 
-        private final Deque<String> messageQueue = new ConcurrentLinkedDeque<>();
+        private final Object writeLock = new Object();
 
         ClientHandler(Socket socket, int clientId) throws IOException {
             this.socket = socket;
@@ -58,13 +57,13 @@ public class TcpServer {
             this.input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             this.output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             sendClientId();
-
-            scheduler.scheduleAtFixedRate(this::flushMessages, RATE_LIMIT_INTERVAL_MS, RATE_LIMIT_INTERVAL_MS, TimeUnit.MILLISECONDS);
         }
 
         private void sendClientId() throws IOException {
-            output.writeInt(Integer.reverseBytes(clientId));
-            output.flush();
+            synchronized (writeLock) {
+                output.writeInt(Integer.reverseBytes(clientId));
+                output.flush();
+            }
         }
 
         @Override
@@ -132,18 +131,17 @@ public class TcpServer {
 
             String tcStr = params.get("tc");
             if (tcStr == null || tcStr.equals("0")) {
-                // Broadcast to lobby without duplication
                 Set<Integer> sent = new HashSet<>();
                 for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
                     if (sent.add(targetId)) {
                         ClientHandler target = clients.get(targetId);
-                        if (target != null) target.enqueueMessage(msg);
+                        if (target != null) target.sendInstant(msg);
                     }
                 }
             } else {
                 int targetId = Integer.parseInt(tcStr);
                 ClientHandler target = clients.get(targetId);
-                if (target != null) target.enqueueMessage(msg);
+                if (target != null) target.sendInstant(msg);
             }
         }
 
@@ -152,7 +150,7 @@ public class TcpServer {
             for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
                 if (sent.add(targetId)) {
                     ClientHandler target = clients.get(targetId);
-                    if (target != null) target.enqueueMessage(msg);
+                    if (target != null) target.sendInstant(msg);
                 }
             }
         }
@@ -160,7 +158,7 @@ public class TcpServer {
         private void syncInfoToLobby(String msg) {
             for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
                 ClientHandler target = clients.get(targetId);
-                if (target != null) target.enqueueMessage(msg);
+                if (target != null) target.sendInstant(msg);
             }
         }
 
@@ -175,7 +173,7 @@ public class TcpServer {
             if (gamelist.length() > 9 && gamelist.charAt(gamelist.length() - 1) == '|') {
                 gamelist.setLength(gamelist.length() - 1);
             }
-            enqueueMessage(gamelist.toString());
+            sendInstant(gamelist.toString());
         }
 
         private void handleConnect(Map<String, String> params) {
@@ -185,50 +183,34 @@ public class TcpServer {
 
             ClientHandler host = clients.get(hostId);
             if (host != null) {
-                host.enqueueMessage("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
+                host.sendInstant("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
             }
             sendAck();
         }
 
-        private void enqueueMessage(String msg) {
-            messageQueue.offer(msg);
+        private void sendAck() {
+            sendInstant("ack:ok");
         }
 
-        private void enqueueAck(String msg) {
-            messageQueue.addFirst(msg);
-        }
-
-        private void flushMessages() {
-            while (!messageQueue.isEmpty()) {
-                sendMessage(messageQueue.poll());
-            }
+        private void sendInstant(String msg) {
             try {
-                output.flush();
+                byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
+                synchronized (writeLock) {
+                    output.writeInt(Integer.reverseBytes(msgBytes.length));
+                    output.write(msgBytes);
+                    output.flush();
+                }
             } catch (IOException e) {
                 shutdown();
             }
         }
 
         private void sendPing() {
-            enqueueMessage("ping:" + (++lastPingId));
+            sendInstant("ping:" + (++lastPingId));
         }
 
         private void checkTimeout() {
             if (System.currentTimeMillis() - lastPongTime > PING_TIMEOUT_MS) shutdown();
-        }
-
-        private void sendAck() {
-            enqueueAck("ack:ok");
-        }
-
-        private void sendMessage(String msg) {
-            try {
-                byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
-                output.writeInt(Integer.reverseBytes(msgBytes.length));
-                output.write(msgBytes);
-            } catch (IOException e) {
-                shutdown();
-            }
         }
 
         private Map<String, String> parseMessage(String msg) {
