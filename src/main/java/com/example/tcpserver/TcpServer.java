@@ -98,7 +98,7 @@ public class TcpServer {
 
             switch (cmd) {
                 case "send":
-                    broadcastLobbyMessage("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|" + message.substring(message.indexOf('|') + 1));
+                    handleSend(params, message);
                     sendAck();
                     break;
                 case "query":
@@ -124,18 +124,44 @@ public class TcpServer {
             }
         }
 
-        private void broadcastLobbyMessage(String msg) {
-            lobbyConnections.get(clientId).forEach(targetId -> {
+        private void handleSend(Map<String, String> params, String originalMsg) {
+            String fp = params.get("fp");
+            String tp = params.get("tp");
+            String data = originalMsg.contains("|") ? originalMsg.substring(originalMsg.indexOf('|') + 1) : "";
+            String msg = "fc:" + clientId + ",fp:" + fp + ",tp:" + tp + "|" + data;
+
+            String tcStr = params.get("tc");
+            if (tcStr == null || tcStr.equals("0")) {
+                // Broadcast to lobby without duplication
+                Set<Integer> sent = new HashSet<>();
+                for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
+                    if (sent.add(targetId)) {
+                        ClientHandler target = clients.get(targetId);
+                        if (target != null) target.enqueueMessage(msg);
+                    }
+                }
+            } else {
+                int targetId = Integer.parseInt(tcStr);
                 ClientHandler target = clients.get(targetId);
                 if (target != null) target.enqueueMessage(msg);
-            });
+            }
+        }
+
+        private void broadcastLobbyMessage(String msg) {
+            Set<Integer> sent = new HashSet<>();
+            for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
+                if (sent.add(targetId)) {
+                    ClientHandler target = clients.get(targetId);
+                    if (target != null) target.enqueueMessage(msg);
+                }
+            }
         }
 
         private void syncInfoToLobby(String msg) {
-            lobbyConnections.get(clientId).forEach(targetId -> {
+            for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
                 ClientHandler target = clients.get(targetId);
                 if (target != null) target.enqueueMessage(msg);
-            });
+            }
         }
 
         private void handleQuery() {
