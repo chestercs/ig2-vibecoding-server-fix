@@ -107,6 +107,7 @@ public class TcpServer {
                 case "info":
                     if (params.containsKey("nam") && !params.get("nam").trim().isEmpty()) {
                         clientParams.put(clientId, params);
+                        syncInfoToLobby("info," + formatParams(params));
                     }
                     sendAck();
                     break;
@@ -130,6 +131,13 @@ public class TcpServer {
             });
         }
 
+        private void syncInfoToLobby(String msg) {
+            lobbyConnections.get(clientId).forEach(targetId -> {
+                ClientHandler target = clients.get(targetId);
+                if (target != null) target.enqueueMessage(msg);
+            });
+        }
+
         private void handleQuery() {
             StringBuilder gamelist = new StringBuilder("gamelist:");
             clients.forEach((id, handler) -> {
@@ -146,7 +154,8 @@ public class TcpServer {
 
         private void handleConnect(Map<String, String> params) {
             int hostId = Integer.parseInt(params.get("tc"));
-            lobbyConnections.get(clientId).add(hostId); // Only one-way
+            lobbyConnections.get(clientId).add(hostId);
+            lobbyConnections.get(hostId).add(clientId);
 
             ClientHandler host = clients.get(hostId);
             if (host != null) {
@@ -160,7 +169,7 @@ public class TcpServer {
         }
 
         private void enqueueAck(String msg) {
-            messageQueue.addFirst(msg); // Prioritize ACKs
+            messageQueue.addFirst(msg);
         }
 
         private void flushMessages() {
@@ -204,6 +213,16 @@ public class TcpServer {
                 if (kv.length == 2) params.put(kv[0], kv[1]);
             }
             return params;
+        }
+
+        private String formatParams(Map<String, String> params) {
+            StringBuilder sb = new StringBuilder();
+            int count = 0;
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                if (count++ > 0) sb.append(",");
+                sb.append(entry.getKey()).append(":").append(entry.getValue());
+            }
+            return sb.toString();
         }
 
         private void shutdown() {
