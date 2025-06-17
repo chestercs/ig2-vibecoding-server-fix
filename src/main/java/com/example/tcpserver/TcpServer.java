@@ -11,8 +11,7 @@ public class TcpServer {
     private static final int PORT = 1611;
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
-    private static final int MESSAGE_BUFFER_MS = 20;
-    private static final int RATE_LIMIT_INTERVAL_MS = 50;
+    private static final int RATE_LIMIT_INTERVAL_MS = 100;
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -51,7 +50,6 @@ public class TcpServer {
         private volatile long lastPongTime = System.currentTimeMillis();
 
         private final Queue<String> messageQueue = new ConcurrentLinkedQueue<>();
-        private long lastSentTime = 0;
 
         ClientHandler(Socket socket, int clientId) throws IOException {
             this.socket = socket;
@@ -60,7 +58,7 @@ public class TcpServer {
             this.output = new DataOutputStream(socket.getOutputStream());
             sendClientId();
 
-            scheduler.scheduleAtFixedRate(this::flushMessages, MESSAGE_BUFFER_MS, MESSAGE_BUFFER_MS, TimeUnit.MILLISECONDS);
+            scheduler.scheduleAtFixedRate(this::flushMessages, RATE_LIMIT_INTERVAL_MS, RATE_LIMIT_INTERVAL_MS, TimeUnit.MILLISECONDS);
         }
 
         private void sendClientId() throws IOException {
@@ -158,14 +156,8 @@ public class TcpServer {
         }
 
         private void flushMessages() {
-            long now = System.currentTimeMillis();
-            if (now - lastSentTime < RATE_LIMIT_INTERVAL_MS) return;
-
-            List<String> msgs = new ArrayList<>();
-            while (!messageQueue.isEmpty()) msgs.add(messageQueue.poll());
-            if (!msgs.isEmpty()) {
-                sendMessage(String.join("|", msgs));
-                lastSentTime = now;
+            while (!messageQueue.isEmpty()) {
+                sendMessage(messageQueue.poll());
             }
         }
 
