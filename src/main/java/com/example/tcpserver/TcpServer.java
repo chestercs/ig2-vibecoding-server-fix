@@ -11,6 +11,7 @@ public class TcpServer {
     private static final int PORT = 1611;
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
+    private static final int RATE_LIMIT_MS = 50; // Max 20 msg/sec per target
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -50,6 +51,7 @@ public class TcpServer {
         private volatile long lastPongTime = System.currentTimeMillis();
 
         private final Object writeLock = new Object();
+        private final Map<Integer, Long> lastSentToClient = new ConcurrentHashMap<>();
 
         ClientHandler(Socket socket, int clientId) throws IOException {
             this.socket = socket;
@@ -130,19 +132,32 @@ public class TcpServer {
             String msg = "fc:" + clientId + ",fp:" + fp + ",tp:" + tp + "|" + data;
 
             String tcStr = params.get("tc");
+            long now = System.currentTimeMillis();
+
             if (tcStr == null || tcStr.equals("0")) {
                 Set<Integer> sent = new HashSet<>();
                 for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
-                    if (sent.add(targetId)) {
+                    if (sent.add(targetId) && rateLimitPassed(targetId, now)) {
                         ClientHandler target = clients.get(targetId);
                         if (target != null) target.sendInstant(msg);
                     }
                 }
             } else {
                 int targetId = Integer.parseInt(tcStr);
-                ClientHandler target = clients.get(targetId);
-                if (target != null) target.sendInstant(msg);
+                if (rateLimitPassed(targetId, now)) {
+                    ClientHandler target = clients.get(targetId);
+                    if (target != null) target.sendInstant(msg);
+                }
             }
+        }
+
+        private boolean rateLimitPassed(int targetId, long now) {
+            long last = lastSentToClient.getOrDefault(targetId, 0L);
+            if (now - last >= RATE_LIMIT_MS) {
+                lastSentToClient.put(targetId, now);
+                return true;
+            }
+            return false;
         }
 
         private void broadcastLobbyMessage(String msg) {
