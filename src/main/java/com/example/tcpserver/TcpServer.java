@@ -38,6 +38,23 @@ public class TcpServer {
         ServerSocket serverSocket = new ServerSocket(PORT);
         System.out.println("TCP server listening on port " + PORT);
 
+        // ───── Tick‑echo: 50 ms‑enként minden aktív peernek küldünk egy üres "fc" csomagot,
+        // hogy a kliens ne érezze úgy, hogy egyedül maradt és ne dobja le a kapcsolatot a játék indításakor.
+        ScheduledExecutorService tick = Executors.newSingleThreadScheduledExecutor();
+        tick.scheduleAtFixedRate(() -> {
+            long now = System.currentTimeMillis();
+            for (ClientHandler sender : clients.values()) {
+                for (Integer targetId : lobbyConnections.getOrDefault(sender.clientId, Set.of())) {
+                    if (targetId.equals(sender.clientId)) continue;
+                    ClientHandler target = clients.get(targetId);
+                    if (target != null) {
+                        String hb = "fc:" + sender.clientId + ",fp:0,tp:0|" + now;
+                        target.send(hb);
+                    }
+                }
+            }
+        }, 1000, 50, TimeUnit.MILLISECONDS);
+
         while (true) {
             Socket socket = serverSocket.accept();
             socket.setTcpNoDelay(true);
