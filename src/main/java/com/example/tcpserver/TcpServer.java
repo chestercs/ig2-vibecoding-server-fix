@@ -11,7 +11,7 @@ public class TcpServer {
     private static final int PORT = 1611;
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
-    private static final int RATE_LIMIT_MS = 50; // Max 20 msg/sec per target
+    private static final int RATE_LIMIT_MS = 50;
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -62,8 +62,6 @@ public class TcpServer {
             this.input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             this.output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             sendClientId();
-
-            // Background flusher for game messages
             flushScheduler.scheduleAtFixedRate(this::flushSendQueue, 0, 15, TimeUnit.MILLISECONDS);
         }
 
@@ -84,8 +82,13 @@ public class TcpServer {
                     int size = Integer.reverseBytes(input.readInt());
                     byte[] data = new byte[size];
                     input.readFully(data);
-                    String message = new String(data, StandardCharsets.UTF_8);
-                    handleMessage(message);
+
+                    // ELŐRE küldött ack:ok válasz
+                    sendAck();
+
+                    // A feldolgozást külön szálon végezzük, hogy ne blokkolja a következő read-et
+                    final String message = new String(data, StandardCharsets.UTF_8);
+                    scheduler.execute(() -> handleMessage(message));
                 }
             } catch (IOException e) {
                 System.out.println("Connection error (id: " + clientId + "): " + e.getMessage());
@@ -102,8 +105,6 @@ public class TcpServer {
 
             Map<String, String> params = parseMessage(message);
             String cmd = params.get("cmd");
-
-            sendAck(); // pre-emptive ack
 
             switch (cmd) {
                 case "send":
