@@ -142,6 +142,7 @@ public class TcpServer {
             if (tcStr == null || tcStr.equals("0")) {
                 Set<Integer> sent = new HashSet<>();
                 for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
+                    if (targetId == clientId) continue; // NE küldjük vissza magának
                     if (sent.add(targetId) && rateLimitPassed(targetId, now)) {
                         ClientHandler target = clients.get(targetId);
                         if (target != null) target.enqueueMessage(msg);
@@ -149,6 +150,7 @@ public class TcpServer {
                 }
             } else {
                 int targetId = Integer.parseInt(tcStr);
+                if (targetId == clientId) return; // szintén tiltsuk le saját targetet
                 if (rateLimitPassed(targetId, now)) {
                     ClientHandler target = clients.get(targetId);
                     if (target != null) target.enqueueMessage(msg);
