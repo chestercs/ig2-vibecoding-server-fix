@@ -163,8 +163,14 @@ public class TcpServer {
         //───────────────────────────────────────────  cmd:disconnect
         private void handleDisconnect(Map<String,String> p) {
             int peer = Integer.parseInt(p.getOrDefault("fc","0"));
-            lobbyConnections.getOrDefault(clientId, Set.of()).remove(peer);
-            lobbyConnections.getOrDefault(peer, Set.of()).remove(clientId);
+
+            // biztonságosan távolítjuk el a kapcsolatot anélkül, hogy Immutable set‑hez nyúlnánk
+            Set<Integer> mySet   = lobbyConnections.get(clientId);
+            if (mySet != null)   mySet.remove(peer);
+
+            Set<Integer> peerSet = lobbyConnections.get(peer);
+            if (peerSet != null) peerSet.remove(clientId);
+
             ClientHandler ch = clients.get(peer);
             if (ch != null) ch.send("disconnected:"+clientId);
             send("ack:ok");
