@@ -98,11 +98,17 @@ public class TcpServer {
             switch (cmd) {
                 case "send" -> handleSend(params, message);
                 case "query" -> handleQuery(params.getOrDefault("str", ""));
-                case "info" -> clientParams.put(clientId, decodeBase64Name(params));
+                case "info" -> {
+                    Map<String, String> decoded = decodeBase64Name(params);
+                    if (decoded.getOrDefault("nam", "").isBlank()) return;
+                    clientParams.put(clientId, decoded);
+                }
                 case "connect" -> handleConnect(params);
                 case "disconnect" -> handleDisconnect(params);
             }
         }
+
+
 
         private void handleSend(Map<String, String> params, String originalMsg) {
             String fp = params.get("fp");
