@@ -163,7 +163,7 @@ public class TcpServer {
         }
 
         public void sendNoop(long now) {
-            sendImmediate("noop:" + now);
+            sendImmediate("ping:noop_" + now);
         }
 
         private void sendImmediate(String msg) {
