@@ -1,3 +1,5 @@
+// (v11: no-op broadcast tick 200ms-ként minden kliensre)
+
 package com.example.tcpserver;
 
 import java.io.*;
@@ -12,6 +14,7 @@ public class TcpServer {
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
     private static final int RATE_LIMIT_MS = 50;
+    private static final int NOOP_INTERVAL_MS = 200;
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -26,6 +29,13 @@ public class TcpServer {
     public void start() throws IOException {
         ServerSocket serverSocket = new ServerSocket(PORT);
         System.out.println("TCP server listening on port " + PORT);
+
+        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
+            long now = System.currentTimeMillis();
+            for (ClientHandler client : clients.values()) {
+                client.sendNoop(now);
+            }
+        }, NOOP_INTERVAL_MS, NOOP_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
         while (true) {
             Socket socket = serverSocket.accept();
@@ -47,7 +57,6 @@ public class TcpServer {
         private final DataOutputStream output;
         private volatile boolean running = true;
         private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
-        private ScheduledExecutorService flushScheduler = Executors.newSingleThreadScheduledExecutor();
         private final Queue<byte[]> sendQueue = new ConcurrentLinkedQueue<>();
 
         private volatile int lastPingId = 0;
@@ -62,7 +71,6 @@ public class TcpServer {
             this.input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             this.output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
             sendClientId();
-            flushScheduler.scheduleAtFixedRate(this::flushSendQueue, 0, 15, TimeUnit.MILLISECONDS);
         }
 
         private void sendClientId() throws IOException {
@@ -83,10 +91,8 @@ public class TcpServer {
                     byte[] data = new byte[size];
                     input.readFully(data);
 
-                    // ELŐRE küldött ack:ok válasz
                     sendAck();
 
-                    // A feldolgozást külön szálon végezzük, hogy ne blokkolja a következő read-et
                     final String message = new String(data, StandardCharsets.UTF_8);
                     scheduler.execute(() -> handleMessage(message));
                 }
@@ -106,27 +112,8 @@ public class TcpServer {
             Map<String, String> params = parseMessage(message);
             String cmd = params.get("cmd");
 
-            switch (cmd) {
-                case "send":
-                    handleSend(params, message);
-                    break;
-                case "query":
-                    handleQuery();
-                    break;
-                case "info":
-                    if (params.containsKey("nam") && !params.get("nam").trim().isEmpty()) {
-                        clientParams.put(clientId, params);
-                        syncInfoToLobby("info," + formatParams(params));
-                    }
-                    break;
-                case "connect":
-                    handleConnect(params);
-                    break;
-                case "start":
-                    broadcastLobbyMessage(message);
-                    break;
-                default:
-                    break;
+            if ("send".equals(cmd)) {
+                handleSend(params, message);
             }
         }
 
@@ -142,7 +129,7 @@ public class TcpServer {
             if (tcStr == null || tcStr.equals("0")) {
                 Set<Integer> sent = new HashSet<>();
                 for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
-                    if (targetId == clientId) continue; // NE küldjük vissza magának
+                    if (targetId == clientId) continue;
                     if (sent.add(targetId) && rateLimitPassed(targetId, now)) {
                         ClientHandler target = clients.get(targetId);
                         if (target != null) target.enqueueMessage(msg);
@@ -150,37 +137,10 @@ public class TcpServer {
                 }
             } else {
                 int targetId = Integer.parseInt(tcStr);
-                if (targetId == clientId) return; // szintén tiltsuk le saját targetet
+                if (targetId == clientId) return;
                 if (rateLimitPassed(targetId, now)) {
                     ClientHandler target = clients.get(targetId);
                     if (target != null) target.enqueueMessage(msg);
-                }
-            }
-        }
-
-        private void enqueueMessage(String msg) {
-            byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            DataOutputStream dos = new DataOutputStream(baos);
-            try {
-                dos.writeInt(Integer.reverseBytes(msgBytes.length));
-                dos.write(msgBytes);
-                dos.flush();
-                sendQueue.offer(baos.toByteArray());
-            } catch (IOException ignored) {}
-        }
-
-        private void flushSendQueue() {
-            if (!sendQueue.isEmpty()) {
-                try {
-                    synchronized (writeLock) {
-                        while (!sendQueue.isEmpty()) {
-                            output.write(sendQueue.poll());
-                        }
-                        output.flush();
-                    }
-                } catch (IOException e) {
-                    shutdown();
                 }
             }
         }
@@ -194,48 +154,6 @@ public class TcpServer {
             return false;
         }
 
-        private void broadcastLobbyMessage(String msg) {
-            Set<Integer> sent = new HashSet<>();
-            for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
-                if (sent.add(targetId)) {
-                    ClientHandler target = clients.get(targetId);
-                    if (target != null) target.enqueueMessage(msg);
-                }
-            }
-        }
-
-        private void syncInfoToLobby(String msg) {
-            for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
-                ClientHandler target = clients.get(targetId);
-                if (target != null) target.enqueueMessage(msg);
-            }
-        }
-
-        private void handleQuery() {
-            StringBuilder gamelist = new StringBuilder("gamelist:");
-            clients.forEach((id, handler) -> {
-                Map<String, String> gp = clientParams.get(id);
-                if (gp != null && gp.containsKey("nam") && !gp.get("nam").trim().isEmpty()) {
-                    gamelist.append("id:").append(id).append(",nam:").append(gp.get("nam")).append("|");
-                }
-            });
-            if (gamelist.length() > 9 && gamelist.charAt(gamelist.length() - 1) == '|') {
-                gamelist.setLength(gamelist.length() - 1);
-            }
-            enqueueMessage(gamelist.toString());
-        }
-
-        private void handleConnect(Map<String, String> params) {
-            int hostId = Integer.parseInt(params.get("tc"));
-            lobbyConnections.get(clientId).add(hostId);
-            lobbyConnections.get(hostId).add(clientId);
-
-            ClientHandler host = clients.get(hostId);
-            if (host != null) {
-                host.enqueueMessage("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
-            }
-        }
-
         private void sendAck() {
             sendImmediate("ack:ok");
         }
@@ -244,7 +162,24 @@ public class TcpServer {
             sendImmediate("ping:" + (++lastPingId));
         }
 
+        public void sendNoop(long now) {
+            sendImmediate("noop:" + now);
+        }
+
         private void sendImmediate(String msg) {
+            try {
+                byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
+                synchronized (writeLock) {
+                    output.writeInt(Integer.reverseBytes(msgBytes.length));
+                    output.write(msgBytes);
+                    output.flush();
+                }
+            } catch (IOException e) {
+                shutdown();
+            }
+        }
+
+        private void enqueueMessage(String msg) {
             try {
                 byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
                 synchronized (writeLock) {
@@ -271,22 +206,11 @@ public class TcpServer {
             return params;
         }
 
-        private String formatParams(Map<String, String> params) {
-            StringBuilder sb = new StringBuilder();
-            int count = 0;
-            for (Map.Entry<String, String> entry : params.entrySet()) {
-                if (count++ > 0) sb.append(",");
-                sb.append(entry.getKey()).append(":").append(entry.getValue());
-            }
-            return sb.toString();
-        }
-
         private void shutdown() {
             running = false;
             clients.remove(clientId);
             lobbyConnections.remove(clientId);
             scheduler.shutdown();
-            flushScheduler.shutdown();
             try {
                 socket.close();
             } catch (IOException ignored) {}
