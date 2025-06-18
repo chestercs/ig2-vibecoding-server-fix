@@ -5,112 +5,95 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
- * Imperium Galactica II – stabil TCP lobby- és játék-szerver (Java 23).
- *
- * Főbb jellemzők
- *  • Azonnali ack:ok a kliensnek   → megszünteti a dead-lockot.
- *  • 10 ms-cel késleltetett broadcast   → nem árasztjuk el a klienst.
- *  • Peer-enként 50 ms rate-limit (≈20 pkt/s)   → stabil sávszél-használat.
- *  • Üres/hibás lobby-név kiszűrése   → nincs „névtelen” lobby-bejegyzés.
- *  • Lobby-tagok kölcsönös info-szinkronja (név, faj)   → „computer” név eltűnik.
- *  • Tick-echo (50 ms) csak heartbeat-re   → kliens nem érzi magát „egyedül”.
+ * Imperium Galactica II – matchmaking-szerver (Java 23)
+ * 1-az-1-ben a hivatalos Node.js logikára portolva, kiegészítve:
+ *   • üres lobbyk kiszűrése
+ *   • szellemlobbyk eltávolítása kilépéskor
+ *   • reconnect lehetőség megőrzése
+ *   • ping / pong timeout-kezelés
  */
 public final class TcpServer {
 
     /* konfiguráció */
-    private static final int PORT           = 1611;
-    private static final int RATE_LIMIT_MS  = 50;   // peer-enkénti küldési limit
-    private static final int HEARTBEAT_MS   = 50;   // tick-echo intervallum
+    private static final int PORT             = 1611;
+    private static final int PING_INTERVAL_MS = 10_000;
+    private static final int PING_TIMEOUT_MS  = 15_000;
 
     /* globális állapot */
-    private final Map<Integer, ClientHandler>                clients          = new ConcurrentHashMap<>();
-    private final Map<Integer, Map<String, String>>          clientParams     = new ConcurrentHashMap<>();
-    private final Map<Integer, Set<Integer>>                 lobbyConnections = new ConcurrentHashMap<>();
-    private int clientIdCounter = 0;
+    private final Map<Integer, ClientHandler> clients  = new ConcurrentHashMap<>();
+    private final AtomicInteger               idGen    = new AtomicInteger();
 
-    /* ─────────────────────────────────────────  belépési pont  */
-    public static void main(String[] args) {
-        try {
-            new TcpServer().start();
-        } catch (IOException ex) {
-            System.err.println("Szerver nem indítható: " + ex.getMessage());
-        }
+    public static void main(String[] args) throws IOException {
+        new TcpServer().start();
     }
 
-    /* ─────────────────────────────────────────  fő accept-ciklus  */
-    public void start() throws IOException {
-
-        ServerSocket serverSocket = new ServerSocket(PORT);
+    /* fő accept-ciklus */
+    private void start() throws IOException {
+        ServerSocket ss = new ServerSocket(PORT);
         System.out.println("TCP szerver elindult a " + PORT + "-es porton.");
-
-        /* 50 ms-enként heartbeat minden peer-párnak  */
-        ScheduledExecutorService tick = Executors.newSingleThreadScheduledExecutor();
-        tick.scheduleAtFixedRate(this::sendHeartbeats,
-                1000, HEARTBEAT_MS, TimeUnit.MILLISECONDS);
-
-        while (true) {                         // végtelen accept-ciklus
-            Socket sock = serverSocket.accept();
+        while (true) {
+            Socket sock = ss.accept();
             sock.setTcpNoDelay(true);
-
-            int id = ++clientIdCounter;
+            int id = idGen.incrementAndGet();
             ClientHandler ch = new ClientHandler(sock, id);
             clients.put(id, ch);
-            lobbyConnections.put(id, ConcurrentHashMap.newKeySet());
-
             new Thread(ch, "cli-" + id).start();
-            System.out.println("Új kapcsolat: " + sock.getRemoteSocketAddress() + " (id:" + id + ")");
+            System.out.println("Kapcsolat: " + sock.getRemoteSocketAddress() + " (id:" + id + ")");
         }
     }
 
-    /* ─────────────────────────────────  HEARTBEAT minden peernek  */
-    private void sendHeartbeats() {
-        long now = System.currentTimeMillis();
-        for (ClientHandler sender : clients.values()) {
-            Set<Integer> targets = lobbyConnections.getOrDefault(sender.clientId, Set.of());
-            for (Integer tid : targets) {
-                if (tid.equals(sender.clientId)) continue;
-                ClientHandler trg = clients.get(tid);
-                if (trg != null) {
-                    String hb = "fc:" + sender.clientId + ",fp:0,tp:0|" + now;
-                    trg.send(hb);
-                }
-            }
-        }
-    }
-
-    /* ════════════════════════════════  BELSŐ OSZTÁLY  ════════════════════════════════ */
+    /* ═══════════════════ klienskezelő ═══════════════════ */
     private final class ClientHandler implements Runnable {
 
-        private final Socket socket;
-        private final int    clientId;
-        private final DataInputStream  in;
-        private final DataOutputStream out;
+        final Socket sock;
+        final int    id;
+        final DataInputStream  in;
+        final DataOutputStream out;
 
-        private final Map<Integer, Long> lastSent = new ConcurrentHashMap<>();
-        private final Object writeLock = new Object();
-        private final ScheduledExecutorService delayed = Executors.newSingleThreadScheduledExecutor();
-        private volatile boolean running = true;
+        /** az adott klienshez kapcsolódó peer-ID-k (host-vendég viszony) */
+        final Map<Integer, Integer> connected = new ConcurrentHashMap<>();
+        /** lobby / játék metaadatai (pl. nam) */
+        Map<String, String> gameParams = null;
 
-        /* konstruktor */
+        volatile boolean running = true;
+        int pingCnt  = 0;
+        int lastPong = 0;
+
         ClientHandler(Socket s, int id) throws IOException {
-            socket   = s;
-            clientId = id;
-            in  = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-            out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-            sendClientId();
+            this.sock = s;
+            this.id   = id;
+            in  = new DataInputStream(new BufferedInputStream(s.getInputStream()));
+            out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
+            sendId();
+            startPingLoop();
         }
 
-        private void sendClientId() throws IOException {
-            synchronized (writeLock) {
-                out.writeInt(Integer.reverseBytes(clientId));
-                out.flush();
-            }
+        private void sendId() throws IOException {
+            out.writeInt(Integer.reverseBytes(id));
+            out.flush();
         }
 
-        /* fő olvasó ciklus */
+        private void startPingLoop() {
+            Executors.newSingleThreadScheduledExecutor()
+                    .scheduleAtFixedRate(this::ping,
+                            PING_INTERVAL_MS,
+                            PING_INTERVAL_MS,
+                            TimeUnit.MILLISECONDS);
+        }
+
+        private void ping() {
+            if (!running) return;
+            send("ping:" + (++pingCnt));
+            /* timeout watchdog */
+            Executors.newSingleThreadScheduledExecutor()
+                    .schedule(() -> { if (lastPong != pingCnt) shutdown(); },
+                            PING_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        }
+
         @Override public void run() {
             try {
                 while (running) {
@@ -118,179 +101,172 @@ public final class TcpServer {
                     byte[] buf = in.readNBytes(len);
                     process(new String(buf, StandardCharsets.UTF_8));
                 }
-            } catch (IOException ex) {
-                System.out.println("Kapcsolathiba (id:" + clientId + "): " + ex.getMessage());
-            } finally { shutdown(); }
+            } catch (IOException ignored) { }
+            finally { shutdown(); }
         }
 
-        /* ─── üzenetek feldolgozása */
+        /* üzenet-feldolgozás */
         private void process(String msg) {
-            if (msg.startsWith("pong:")) return;            // ping-pongra most nem reagálunk külön
-
-            Map<String,String> p = parse(msg);
-            String cmd = p.get("cmd");
-            if (cmd == null) return;
-
-            switch (cmd) {
-                case "send"       -> handleSend(p, msg);
-                case "query"      -> handleQuery(p.getOrDefault("str", ""));
+            if (msg.startsWith("pong:")) {
+                lastPong = Integer.parseInt(msg.substring(5));
+                return;
+            }
+            Map<String, String> p = parse(msg);
+            switch (p.getOrDefault("cmd", "")) {
+                case "send"       -> handleSend(p);
                 case "info"       -> handleInfo(p);
+                case "query"      -> handleQuery(p.getOrDefault("str", ""));
                 case "connect"    -> handleConnect(p);
                 case "disconnect" -> handleDisconnect(p);
-                default           -> { /* ismeretlen parancs – ignoráljuk */ }
             }
         }
 
-        /* info – lobby meta (név, faj) */
-        private void handleInfo(Map<String,String> p) {
-            Map<String,String> inf = decodeName(p);
-            if (inf.getOrDefault("nam", "").isBlank()) return;
-            clientParams.put(clientId, inf);
+        /* -------- Node.js parancsok portja -------- */
 
-            // broadcast minden lobby-tag felé
-            String pkt = "info," + flat(inf);
-            lobbyConnections.getOrDefault(clientId, Set.of()).forEach(tid -> {
-                if (tid != clientId) {
-                    ClientHandler trg = clients.get(tid);
-                    if (trg != null) trg.send(pkt);
-                }
-            });
+        /** játék közbeni adat */
+        private void handleSend(Map<String, String> p) {
+            if (!p.containsKey("data")) return;
+            String pkt = "fc:" + id
+                    + ",fp:" + p.get("fp")
+                    + ",tp:" + p.get("tp")
+                    + "|"   + p.get("data");
+
+            if ("0".equals(p.get("tc"))) {
+                clients.values().forEach(c -> { if (c.id != id) c.send(pkt); });
+                send("ack:ok");
+            } else {
+                ClientHandler trg = clients.get(Integer.parseInt(p.get("tc")));
+                if (trg != null) { trg.send(pkt); send("ack:ok"); }
+                else             { send("ack:error"); }
+            }
         }
 
-        /* lobby listázás */
+        /** lobby metaadat (név, faj) */
+        private void handleInfo(Map<String, String> p) {
+            gameParams = new HashMap<>();
+            p.forEach((k, v) -> { if (!"cmd".equals(k)) gameParams.put(k, v); });
+            if (gameParams.containsKey("nam"))
+                gameParams.put("nam",
+                        new String(Base64.getDecoder().decode(gameParams.get("nam")),
+                                StandardCharsets.UTF_8));
+        }
+
+        /** lobby lekérdezés */
         private void handleQuery(String search) {
-            String s = search.toLowerCase();
+            String q = search.toLowerCase();
             List<String> list = new ArrayList<>();
-            for (var e : clientParams.entrySet()) {
-                String name = e.getValue().getOrDefault("nam", "");
-                int pos = name.toLowerCase().indexOf(s);
-                if (pos >= 0) {
-                    Map<String,String> c = new HashMap<>(e.getValue());
-                    c.put("id", String.valueOf(e.getKey()));
-                    c.put("sti", String.valueOf(pos));
-                    c.put("nam", Base64.getEncoder().encodeToString(name.getBytes(StandardCharsets.UTF_8)));
-                    list.add(flat(c));
-                    if (list.size() == 100) break;
-                }
-            }
+
+            clients.values().stream()
+                    .filter(c -> c.gameParams != null
+                            && c.gameParams.containsKey("nam")
+                            && !c.gameParams.get("nam").isBlank())
+                    .filter(c -> c.gameParams.get("nam").toLowerCase().contains(q))
+                    .limit(100)
+                    .forEach(c -> {
+                        Map<String, String> gp = new HashMap<>(c.gameParams);
+                        gp.put("id",  String.valueOf(c.id));
+                        gp.put("sti", String.valueOf(
+                                c.gameParams.get("nam").toLowerCase().indexOf(q)));
+                        gp.put("nam", Base64.getEncoder().encodeToString(
+                                c.gameParams.get("nam").getBytes(StandardCharsets.UTF_8)));
+                        list.add(flat(gp));
+                    });
+
             send("gamelist:" + String.join("|", list));
         }
 
-        /* kliens -> host csatlakozás */
-        private void handleConnect(Map<String,String> p) {
-            int hostId = Integer.parseInt(p.getOrDefault("tc", "0"));
-            if (hostId == 0 || hostId == clientId) { send("ack:error"); return; }
+        /** vendég csatlakozás a hosthoz */
+        private void handleConnect(Map<String, String> p) {
+            int tc = Integer.parseInt(p.get("tc"));
+            ClientHandler trg = clients.get(tc);
+            if (trg != null) {
+                connected.put(tc, 1);
+                trg.connected.put(id, 1);
+                trg.send("fc:" + id
+                        + ",fp:" + p.get("fp")
+                        + ",tp:" + p.get("tp")
+                        + "|!connect!");
+                send("ack:ok");
+            } else send("ack:error");
+        }
 
-            ClientHandler host = clients.get(hostId);
-            if (host == null) { send("ack:error"); return; }
+        /** kapcsolat bontása */
+        private void handleDisconnect(Map<String, String> p) {
+            int fc = Integer.parseInt(p.getOrDefault("fc", "0"));
 
-            lobbyConnections.get(clientId).add(hostId);
-            lobbyConnections.get(hostId).add(clientId);
+            if (fc == 0) {
+                // teljes lekapcsolódás (host tényleg kilép)
+                connected.keySet().forEach(k -> {
+                    ClientHandler trg = clients.get(k);
+                    if (trg != null) {
+                        trg.connected.remove(id);
+                        trg.send("disconnected:" + id);
+                    }
+                });
+                connected.clear();
 
-            // értesítjük a hostot
-            host.send("fc:"+clientId+",fp:"+p.get("fp")+",tp:"+p.get("tp")+"|!connect!");
+                // Itt TÖRÖLD a gameParams-ot, csak ilyenkor!
+                gameParams = null;
+                send("ack:ok");
+                return;
+            }
 
-            // host infó -> kliens
-            Optional.ofNullable(clientParams.get(hostId)).ifPresent(info ->
-                    send("info," + flat(info)));
-
-            // új kliens infó -> host
-            Optional.ofNullable(clientParams.get(clientId)).ifPresent(info ->
-                    host.send("info," + flat(info)));
-
+            // részleges bontás (guest lép ki)
+            ClientHandler trg = clients.get(fc);
+            if (trg != null) {
+                connected.remove(fc);
+                trg.connected.remove(id);
+                trg.send("disconnected:" + id);
+            }
             send("ack:ok");
         }
 
-        /* kapcsolat bontása */
-        private void handleDisconnect(Map<String,String> p) {
-            int peer = Integer.parseInt(p.getOrDefault("fc", "0"));
 
-            lobbyConnections.getOrDefault(clientId, Set.of()).remove(peer);
-            lobbyConnections.getOrDefault(peer, Set.of()).remove(clientId);
+        /* ---- util ---- */
 
-            ClientHandler ch = clients.get(peer);
-            if (ch != null) ch.send("disconnected:" + clientId);
-
-            send("ack:ok");
-        }
-
-        /* játék közbeni adat (parancs) */
-        private void handleSend(Map<String,String> p, String raw) {
-            String fp = p.get("fp"), tp = p.get("tp");
-            String data = raw.contains("|") ? raw.substring(raw.indexOf('|')+1) : "";
-            String packet = "fc:"+clientId+",fp:"+fp+",tp:"+tp+"|"+data;
-            String tc = p.get("tc");
-            send("ack:ok");                                 // azonnali ack a kliensnek
-
-            Runnable task = () -> {
-                long now = System.currentTimeMillis();
-                if (tc == null || "0".equals(tc)) {
-                    for (int tgt : lobbyConnections.getOrDefault(clientId, Set.of())) {
-                        if (tgt == clientId) continue;
-                        if (rateLimit(tgt, now)) clients.get(tgt).send(packet);
-                    }
-                } else {
-                    int tgt = Integer.parseInt(tc);
-                    if (tgt != clientId && rateLimit(tgt, now)) {
-                        Optional.ofNullable(clients.get(tgt)).ifPresent(ch -> ch.send(packet));
-                    }
-                }
-            };
-            delayed.schedule(task, 10, TimeUnit.MILLISECONDS);
-        }
-
-        /* ───── segédek ───── */
-        private boolean rateLimit(int tgt, long now) {
-            long last = lastSent.getOrDefault(tgt, 0L);
-            if (now - last >= RATE_LIMIT_MS) { lastSent.put(tgt, now); return true; }
-            return false;
-        }
-
-        private Map<String,String> parse(String msg) {
-            Map<String,String> m = new HashMap<>();
-            String[] parts = msg.split("\\|", 2);
-            for (String part : parts[0].split(",")) {
+        private Map<String, String> parse(String s) {
+            Map<String, String> m = new HashMap<>();
+            int i = s.indexOf('|');
+            String head = (i >= 0) ? s.substring(0, i) : s;
+            for (String part : head.split(",")) {
                 String[] kv = part.split(":", 2);
                 if (kv.length == 2) m.put(kv[0], kv[1]);
             }
-            if (parts.length == 2) m.put("data", parts[1]);
+            if (i >= 0) m.put("data", s.substring(i + 1));
             return m;
         }
 
-        private Map<String,String> decodeName(Map<String,String> m) {
-            if (m.containsKey("nam")) {
-                try {
-                    String d = new String(Base64.getDecoder().decode(m.get("nam")),
-                            StandardCharsets.UTF_8);
-                    m.put("nam", d);
-                } catch (IllegalArgumentException ignored) {}
-            }
-            return m;
-        }
-
-        private String flat(Map<String,String> m) {
+        private String flat(Map<String, String> m) {
             return m.entrySet().stream()
                     .map(e -> e.getKey() + ":" + e.getValue())
                     .collect(Collectors.joining(","));
         }
 
-        private void send(String msg) {
+        private synchronized void send(String msg) {
             try {
                 byte[] b = msg.getBytes(StandardCharsets.UTF_8);
-                synchronized (writeLock) {
-                    out.writeInt(Integer.reverseBytes(b.length));
-                    out.write(b);
-                    out.flush();
-                }
-            } catch (IOException ex) { shutdown(); }
+                out.writeInt(Integer.reverseBytes(b.length));
+                out.write(b);
+                out.flush();
+            } catch (IOException ignored) { }
         }
 
+        /* kapcsolat teljes lezárása */
         private void shutdown() {
             running = false;
-            clients.remove(clientId);
-            lobbyConnections.remove(clientId);
-            try { socket.close(); } catch (IOException ignored) {}
-            System.out.println("Kliense kapcsolat bontva (id:" + clientId + ")");
+
+            /* értesítjük az összes peer-t */
+            connected.keySet().forEach(pid -> {
+                ClientHandler p = clients.get(pid);
+                if (p != null) {
+                    p.connected.remove(id);
+                    p.send("disconnected:" + id);
+                }
+            });
+
+            clients.remove(id);
+            try { sock.close(); } catch (IOException ignored) { }
+            System.out.println("Kapcsolat bontva (id:" + id + ")");
         }
     }
 }
