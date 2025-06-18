@@ -1,5 +1,3 @@
-// (v11: no-op broadcast tick 200ms-ként minden kliensre)
-
 package com.example.tcpserver;
 
 import java.io.*;
@@ -14,7 +12,6 @@ public class TcpServer {
     private static final int PING_INTERVAL_MS = 10000;
     private static final int PING_TIMEOUT_MS = 15000;
     private static final int RATE_LIMIT_MS = 50;
-    private static final int NOOP_INTERVAL_MS = 200;
 
     private final ConcurrentHashMap<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, Map<String, String>> clientParams = new ConcurrentHashMap<>();
@@ -29,13 +26,6 @@ public class TcpServer {
     public void start() throws IOException {
         ServerSocket serverSocket = new ServerSocket(PORT);
         System.out.println("TCP server listening on port " + PORT);
-
-        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
-            long now = System.currentTimeMillis();
-            for (ClientHandler client : clients.values()) {
-                client.sendNoop(now);
-            }
-        }, NOOP_INTERVAL_MS, NOOP_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
         while (true) {
             Socket socket = serverSocket.accept();
@@ -57,7 +47,6 @@ public class TcpServer {
         private final DataOutputStream output;
         private volatile boolean running = true;
         private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
-        private final Queue<byte[]> sendQueue = new ConcurrentLinkedQueue<>();
 
         private volatile int lastPingId = 0;
         private volatile long lastPongTime = System.currentTimeMillis();
@@ -91,8 +80,6 @@ public class TcpServer {
                     byte[] data = new byte[size];
                     input.readFully(data);
 
-                    sendAck();
-
                     final String message = new String(data, StandardCharsets.UTF_8);
                     scheduler.execute(() -> handleMessage(message));
                 }
@@ -114,6 +101,14 @@ public class TcpServer {
 
             if ("send".equals(cmd)) {
                 handleSend(params, message);
+            } else if ("query".equals(cmd)) {
+                handleQuery(params.getOrDefault("str", ""));
+            } else if ("info".equals(cmd)) {
+                clientParams.put(clientId, params);
+            } else if ("connect".equals(cmd)) {
+                handleConnect(params);
+            } else if ("disconnect".equals(cmd)) {
+                handleDisconnect(params);
             }
         }
 
@@ -124,25 +119,80 @@ public class TcpServer {
             String msg = "fc:" + clientId + ",fp:" + fp + ",tp:" + tp + "|" + data;
 
             String tcStr = params.get("tc");
-            long now = System.currentTimeMillis();
 
-            if (tcStr == null || tcStr.equals("0")) {
-                Set<Integer> sent = new HashSet<>();
-                for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
-                    if (targetId == clientId) continue;
-                    if (sent.add(targetId) && rateLimitPassed(targetId, now)) {
+            // Azonnali ack a kliensnek
+            sendAck();
+
+            Runnable broadcast = () -> {
+                long now = System.currentTimeMillis();
+
+                if (tcStr == null || tcStr.equals("0")) {
+                    Set<Integer> sent = new HashSet<>();
+                    for (int targetId : lobbyConnections.getOrDefault(clientId, Collections.emptySet())) {
+                        if (targetId == clientId) continue;
+                        if (sent.add(targetId) && rateLimitPassed(targetId, now)) {
+                            ClientHandler target = clients.get(targetId);
+                            if (target != null) target.sendString(msg);
+                        }
+                    }
+                } else {
+                    int targetId = Integer.parseInt(tcStr);
+                    if (targetId == clientId) return;
+                    if (rateLimitPassed(targetId, now)) {
                         ClientHandler target = clients.get(targetId);
-                        if (target != null) target.enqueueMessage(msg);
+                        if (target != null) target.sendString(msg);
                     }
                 }
-            } else {
-                int targetId = Integer.parseInt(tcStr);
-                if (targetId == clientId) return;
-                if (rateLimitPassed(targetId, now)) {
-                    ClientHandler target = clients.get(targetId);
-                    if (target != null) target.enqueueMessage(msg);
+            };
+
+            scheduler.schedule(broadcast, 10, TimeUnit.MILLISECONDS);
+        }
+
+        private void handleQuery(String str) {
+            String search = str.toLowerCase();
+            List<String> results = new ArrayList<>();
+            for (Map.Entry<Integer, Map<String, String>> entry : clientParams.entrySet()) {
+                Map<String, String> gp = entry.getValue();
+                String name = gp.get("nam");
+                if (name != null && name.toLowerCase().contains(search)) {
+                    Map<String, String> copy = new HashMap<>(gp);
+                    copy.put("id", String.valueOf(entry.getKey()));
+                    copy.put("sti", String.valueOf(name.toLowerCase().indexOf(search)));
+                    String encoded = Base64.getEncoder().encodeToString(name.getBytes(StandardCharsets.UTF_8));
+                    copy.put("nam", encoded);
+                    results.add(flatten(copy));
+                    if (results.size() >= 100) break;
                 }
             }
+            sendString("gamelist:" + String.join("|", results));
+        }
+
+        private void handleConnect(Map<String, String> params) {
+            int targetId = Integer.parseInt(params.getOrDefault("tc", "0"));
+            if (targetId == 0) {
+                sendString("ack:error");
+                return;
+            }
+            ClientHandler target = clients.get(targetId);
+            if (target != null) {
+                lobbyConnections.get(clientId).add(targetId);
+                lobbyConnections.get(targetId).add(clientId);
+                target.sendString("fc:" + clientId + ",fp:" + params.get("fp") + ",tp:" + params.get("tp") + "|!connect!");
+                sendString("ack:ok");
+            } else {
+                sendString("ack:error");
+            }
+        }
+
+        private void handleDisconnect(Map<String, String> params) {
+            int peerId = Integer.parseInt(params.getOrDefault("fc", "0"));
+            lobbyConnections.getOrDefault(clientId, new HashSet<>()).remove(peerId);
+            lobbyConnections.getOrDefault(peerId, new HashSet<>()).remove(clientId);
+            ClientHandler peer = clients.get(peerId);
+            if (peer != null) {
+                peer.sendString("disconnected:" + clientId);
+            }
+            sendString("ack:ok");
         }
 
         private boolean rateLimitPassed(int targetId, long now) {
@@ -155,18 +205,14 @@ public class TcpServer {
         }
 
         private void sendAck() {
-            sendImmediate("ack:ok");
+            sendString("ack:ok");
         }
 
         private void sendPing() {
-            sendImmediate("ping:" + (++lastPingId));
+            sendString("ping:" + (++lastPingId));
         }
 
-        public void sendNoop(long now) {
-            sendImmediate("ping:noop_" + now);
-        }
-
-        private void sendImmediate(String msg) {
+        private void sendString(String msg) {
             try {
                 byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
                 synchronized (writeLock) {
@@ -177,33 +223,32 @@ public class TcpServer {
             } catch (IOException e) {
                 shutdown();
             }
-        }
-
-        private void enqueueMessage(String msg) {
-            try {
-                byte[] msgBytes = msg.getBytes(StandardCharsets.UTF_8);
-                synchronized (writeLock) {
-                    output.writeInt(Integer.reverseBytes(msgBytes.length));
-                    output.write(msgBytes);
-                    output.flush();
-                }
-            } catch (IOException e) {
-                shutdown();
-            }
-        }
-
-        private void checkTimeout() {
-            if (System.currentTimeMillis() - lastPongTime > PING_TIMEOUT_MS) shutdown();
         }
 
         private Map<String, String> parseMessage(String msg) {
             Map<String, String> params = new HashMap<>();
-            String[] parts = msg.split("[|,]");
-            for (String part : parts) {
-                String[] kv = part.split(":", 2);
+            String[] sections = msg.split("\\|", 2);
+            String[] entries = sections[0].split(",");
+            for (String entry : entries) {
+                String[] kv = entry.split(":", 2);
                 if (kv.length == 2) params.put(kv[0], kv[1]);
             }
+            if (sections.length == 2) params.put("data", sections[1]);
             return params;
+        }
+
+        private String flatten(Map<String, String> map) {
+            List<String> parts = new ArrayList<>();
+            for (Map.Entry<String, String> entry : map.entrySet()) {
+                parts.add(entry.getKey() + ":" + entry.getValue());
+            }
+            return String.join(",", parts);
+        }
+
+        private void checkTimeout() {
+            if (System.currentTimeMillis() - lastPongTime > PING_TIMEOUT_MS) {
+                shutdown();
+            }
         }
 
         private void shutdown() {
