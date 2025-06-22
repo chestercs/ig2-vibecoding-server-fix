@@ -5,23 +5,23 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
-public final class TcpServer {
+public final class TcpServerBackup {
 
     private static final int PORT = 1611;
     private static final int PING_INTERVAL_MS = 10_000;
     private static final int PING_TIMEOUT_MS  = 15_000;
-    private static final int HEARTBEAT_INTERVAL_MS = 16; // ~60 FPS
-    // private static final int MIN_PACKET_SIZE = 512; // Paddinghoz
 
     private final Map<Integer, ClientHandler> clients = new ConcurrentHashMap<>();
     private final AtomicInteger idGen = new AtomicInteger();
 
     public static void main(String[] args) throws IOException {
-        new TcpServer().start();
+        new TcpServerBackup().start();
     }
 
     private void start() throws IOException {
@@ -58,8 +58,6 @@ public final class TcpServer {
         int pingCnt  = 0;
         int lastPong = 0;
 
-        private ScheduledExecutorService heartbeatLoop = null;
-
         ClientHandler(Socket s, int id) throws IOException {
             this.sock = s;
             this.id   = id;
@@ -67,7 +65,6 @@ public final class TcpServer {
             out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
             sendId();
             startPingLoop();
-            startHeartbeatLoop();
         }
 
         private void sendId() throws IOException {
@@ -93,18 +90,6 @@ public final class TcpServer {
                             shutdown();
                         }
                     }, PING_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        }
-
-        /**
-         * 60 FPS NOOP/heartbeat küldés
-         * A lobby, chat, ready, stb. változatlanul működik, ez csak dummy forgalom!
-         */
-        private void startHeartbeatLoop() {
-            heartbeatLoop = Executors.newSingleThreadScheduledExecutor();
-            heartbeatLoop.scheduleAtFixedRate(() -> {
-                if (!running) return;
-                send("heartbeat"); // vagy "noop"
-            }, 0, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
         }
 
         @Override
@@ -139,6 +124,7 @@ public final class TcpServer {
             long procStart = System.nanoTime();
             if (msg.startsWith("pong:")) {
                 lastPong = Integer.parseInt(msg.substring(5));
+                //log("[" + id + "] PONG fogadva: " + lastPong);
                 return;
             }
             Map<String, String> p = parse(msg);
@@ -289,28 +275,24 @@ public final class TcpServer {
         }
 
         private synchronized void send(String msg) {
+            long sendStart = System.nanoTime();
+            long nowMs = System.currentTimeMillis();
             try {
                 byte[] b = msg.getBytes(StandardCharsets.UTF_8);
-
-                // --- PADDINGOS MEGOLDÁS (KIKOMMENTELVE, csak referenciának) ---
-                // if (b.length < MIN_PACKET_SIZE) {
-                //     byte[] padded = new byte[MIN_PACKET_SIZE];
-                //     System.arraycopy(b, 0, padded, 0, b.length);
-                //     // Arrays.fill(padded, b.length, MIN_PACKET_SIZE, (byte) 'X');
-                //     b = padded;
-                // }
-
                 out.writeInt(Integer.reverseBytes(b.length));
                 out.write(b);
                 out.flush();
+                long sendDone = System.nanoTime();
+                log("[%d] [LOG] -> KÜLDÉS [%d bytes] @%d ms (nano: %d) [küldési idő: %d ms]: %s"
+                        .formatted(id, b.length, nowMs, sendStart, (sendDone-sendStart)/1_000_000, msg));
             } catch (IOException e) {
+                log("[" + id + "] KÜLDÉSI HIBA: " + e);
                 shutdown();
             }
         }
 
         private void shutdown() {
             running = false;
-            if (heartbeatLoop != null) heartbeatLoop.shutdownNow();
             connected.keySet().forEach(pid -> {
                 ClientHandler p = clients.get(pid);
                 if (p != null) {
@@ -323,4 +305,5 @@ public final class TcpServer {
             log("Kapcsolat bontva (id:" + id + ")");
         }
     }
+
 }
